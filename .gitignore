@@ -1,0 +1,4 @@
+node_modules/
+*.local
+.kagi-key
+.DS_Store
