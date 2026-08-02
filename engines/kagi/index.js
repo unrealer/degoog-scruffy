@@ -4,16 +4,44 @@
 // bare ES modules in its own process, so we cannot import Kagi's official
 // `@kagi/api` client (it carries npm/transitive deps degoog never installs).
 // Instead this is a thin `fetch` wrapper whose request/response shapes mirror
-// Kagi's official OpenAPI types exactly:
-//   request:  SearchRequest        (query, limit, page, safe_search, workflow)
-//   response: Search200ResponseData ({ search: SearchResult[], ... })
-//   item:     SearchResult         ({ url, title, snippet, time, image, props })
-// Ref: https://github.com/kagisearch/kagi-openapi-typescript
+// Kagi's official OpenAPI types exactly.
 
 const API_URL = "https://kagi.com/api/v1/search";
-const MAX_PAGE = 10; // SearchRequest.page is constrained to 1..10 by the API.
+const MAX_PAGE = 10;
+const DEDUPE_TTL_MS = 60_000;
+const HOURLY_REQUEST_LIMIT = 60;
+const HOURLY_WINDOW_MS = 3_600_000;
+const GUARD_KEY = Symbol.for("unrealer.degoog-scruffy.kagi-request-guard.v1");
 
-// Kagi snippets arrive HTML-escaped (e.g. &amp;, &#39;) and may carry markup.
+const guardState = globalThis[GUARD_KEY] ??= {
+  entries: new Map(),
+  requestTimes: [],
+};
+
+const _guardedRequest = (key, requestFn) => {
+  const now = Date.now();
+  guardState.requestTimes = guardState.requestTimes.filter(
+    (timestamp) => now - timestamp < HOURLY_WINDOW_MS,
+  );
+  for (const [entryKey, entry] of guardState.entries) {
+    if (now - entry.createdAt >= DEDUPE_TTL_MS) guardState.entries.delete(entryKey);
+  }
+
+  const existing = guardState.entries.get(key);
+  if (existing) return existing.promise;
+
+  if (guardState.requestTimes.length >= HOURLY_REQUEST_LIMIT) {
+    const promise = Promise.resolve(null);
+    guardState.entries.set(key, { createdAt: now, promise });
+    return promise;
+  }
+
+  guardState.requestTimes.push(now);
+  const promise = Promise.resolve().then(requestFn);
+  guardState.entries.set(key, { createdAt: now, promise });
+  return promise;
+};
+
 const _decodeEntities = (str) =>
   str
     .replace(/&amp;/g, "&")
@@ -66,66 +94,55 @@ export default class KagiEngine {
 
   configure(settings) {
     this.apiKey = settings.apiKey || "";
-
     const parsedLimit = parseInt(settings.limit, 10);
     this.limit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? Math.min(parsedLimit, 1024) : 10;
-
-    // Toggles arrive as the string "true"/"false" from the settings UI, but
-    // tolerate real booleans too.
-    if (typeof settings.safeSearch === "boolean") {
-      this.safeSearch = settings.safeSearch;
-    } else if (typeof settings.safeSearch === "string") {
-      this.safeSearch = settings.safeSearch !== "false";
-    }
+    if (typeof settings.safeSearch === "boolean") this.safeSearch = settings.safeSearch;
+    else if (typeof settings.safeSearch === "string") this.safeSearch = settings.safeSearch !== "false";
   }
 
   async executeSearch(query, page = 1, _timeFilter, context) {
     const q = (query || "").trim();
     if (!q || !this.apiKey) return [];
 
-    // The Kagi Search API caps pagination at page 10. Each page is a separate
-    // billed query, so anything beyond the cap simply returns nothing rather
-    // than re-fetching page 1.
     const pageNum = page || 1;
     if (pageNum > MAX_PAGE) return [];
 
-    const doFetch = context?.fetch ?? fetch;
+    const requestKey = `search\u0000${q}\u0000${pageNum}\u0000${this.limit}\u0000${this.safeSearch}`;
+    const data = await _guardedRequest(requestKey, async () => {
+      const doFetch = context?.fetch ?? fetch;
+      let response;
+      try {
+        response = await doFetch(API_URL, {
+          method: "POST",
+          headers: {
+            Authorization: `Bot ${this.apiKey}`,
+            "Content-Type": "application/json",
+            Accept: "application/json",
+          },
+          body: JSON.stringify({
+            query: q,
+            workflow: "search",
+            limit: this.limit,
+            page: pageNum,
+            safe_search: this.safeSearch,
+          }),
+        });
+      } catch (e) {
+        if (e?.name === "SentinelBreach") throw e;
+        return null;
+      }
 
-    let response;
-    try {
-      response = await doFetch(API_URL, {
-        method: "POST",
-        headers: {
-          Authorization: `Bot ${this.apiKey}`,
-          "Content-Type": "application/json",
-          Accept: "application/json",
-        },
-        body: JSON.stringify({
-          query: q,
-          workflow: "search",
-          limit: this.limit,
-          page: pageNum,
-          safe_search: this.safeSearch,
-        }),
-      });
-    } catch (e) {
-      if (e?.name === "SentinelBreach") throw e;
-      return [];
-    }
+      context?.sentinel?.(response, this.name);
+      try {
+        const payload = await response.json();
+        if (!payload || (Array.isArray(payload.error) && payload.error.length)) return null;
+        return payload.data ?? null;
+      } catch {
+        return null;
+      }
+    });
 
-    context?.sentinel?.(response, this.name);
-
-    let data;
-    try {
-      data = await response.json();
-    } catch {
-      return [];
-    }
-
-    // Error envelope: { meta, data: null, error: [{ code, message, ... }] }.
-    if (!data || Array.isArray(data.error) && data.error.length) return [];
-
-    const items = data?.data?.search;
+    const items = data?.search;
     if (!Array.isArray(items)) return [];
 
     return items
