@@ -115,7 +115,7 @@ export default class KagiEngine {
         response = await doFetch(API_URL, {
           method: "POST",
           headers: {
-            Authorization: `Bot ${this.apiKey}`,
+            Authorization: `Bearer ${this.apiKey}`,
             "Content-Type": "application/json",
             Accept: "application/json",
           },
